@@ -71,14 +71,16 @@ def init_database():
     from app.entities.analysis_result import Base as AnalysisBase
     from app.entities.watchlist import Base as WatchlistBase
     from app.entities.backtest import Base as BacktestBase
-    
+    from app.entities.risk import Base as RiskBase
+
     engine = get_engine()
-    
+
     # 创建所有表
     StockBase.metadata.create_all(bind=engine)
     AnalysisBase.metadata.create_all(bind=engine)
     WatchlistBase.metadata.create_all(bind=engine)
     BacktestBase.metadata.create_all(bind=engine)
+    RiskBase.metadata.create_all(bind=engine)
 
 # 数据源配置
 DATA_SOURCE_CONFIG = {

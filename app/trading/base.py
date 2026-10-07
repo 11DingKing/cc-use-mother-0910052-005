@@ -50,6 +50,8 @@ class Order:
     filled_quantity: int = 0
     filled_price: Optional[Decimal] = None
     commission: Decimal = Decimal("0")
+    # 受理时按估值价冻结的预留价格（组合风控/资金冻结口径）
+    reserved_price: Optional[Decimal] = None
     created_at: datetime = field(default_factory=datetime.now)
     updated_at: datetime = field(default_factory=datetime.now)
     error_message: Optional[str] = None
@@ -72,6 +74,7 @@ class Order:
             "filled_quantity": self.filled_quantity,
             "filled_price": float(self.filled_price) if self.filled_price else None,
             "commission": float(self.commission),
+            "reserved_price": float(self.reserved_price) if self.reserved_price else None,
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
             "error_message": self.error_message,

@@ -19,6 +19,8 @@ from app.trading.simulation_adapter import SimulationAdapter
 from app.trading.vnpy_adapter import VnpyAdapter
 from app.services.analysis_service import AnalysisService
 from app.middleware.exception_handler import AppException
+from app.risk.service import PortfolioRiskService
+from app.risk.store import RiskStore
 
 logger = logging.getLogger(__name__)
 
@@ -48,19 +50,50 @@ class TradingException(AppException):
 class TradingService:
     """业务模块说明。"""
     
-    def __init__(self, adapter: Optional[TradingAdapter] = None):
+    def __init__(
+        self,
+        adapter: Optional[TradingAdapter] = None,
+        risk_store: Optional[RiskStore] = None,
+        portfolio_id: str = "default",
+    ):
         self.adapter = adapter or SimulationAdapter()
         self.risk_manager = RiskManager()
         self.analysis_service = AnalysisService()
         self._auto_trade_enabled = False
-    
+        # 组合级风险预算服务：默认进程内内存存储，可注入持久化 RiskStore
+        self.portfolio_id = portfolio_id
+        self.portfolio_risk = PortfolioRiskService(
+            store=risk_store or RiskStore.in_memory(portfolio_id),
+            portfolio_id=portfolio_id,
+            position_provider=lambda: self.adapter.get_positions(),
+            quote_provider=lambda code: self._safe_quote(code),
+        )
+        self._register_risk_callback(self.adapter)
+
+    def _register_risk_callback(self, adapter: TradingAdapter) -> None:
+        """订单状态变化（挂单/部分成交/全成/撤销）驱动风控台账迁移。"""
+        adapter.register_callback("on_order", self._handle_risk_order_event)
+
+    def _handle_risk_order_event(self, order: Order) -> None:
+        try:
+            self.portfolio_risk.on_order_update(order)
+        except Exception:
+            logger.exception("同步订单 %s 状态到风控台账失败", getattr(order, "order_id", "?"))
+
+    def _safe_quote(self, stock_code: str) -> Optional[Dict[str, Any]]:
+        try:
+            return self.adapter.get_quote(stock_code)
+        except Exception:
+            return None
+
     def connect(self, adapter_type: str = "simulation", config: Optional[Dict] = None) -> bool:
         """业务模块说明。"""
         if adapter_type == "vnpy":
             self.adapter = VnpyAdapter(config or {})
         else:
             self.adapter = SimulationAdapter(config)
-        
+
+        self._register_risk_callback(self.adapter)
         return self.adapter.connect()
     
     def disconnect(self) -> None:
@@ -118,33 +151,46 @@ class TradingService:
             signal_type=signal_type,
             signal_strength=signal_strength,
         )
-        
-        # 风控检查
-        account = self.adapter.get_account()
-        positions = self.adapter.get_positions()
-        
-        passed, reason = self.risk_manager.check_order(order, account, positions)
-        if not passed:
-            raise TradingException(
-                f"风控检查未通过: {reason}",
-                stock_code=stock_code,
-            )
-        
-        # 执行下单
-        result = self.adapter.place_order(order)
-        
+
+        # 组合级风控：在串行事务内完成"检查剩余额度 + 预留"。
+        # 预算不足直接抛 RiskRejectedException（含逐条可解释原因），
+        # 事务回滚，不产生预留。
+        decision = self.portfolio_risk.check_and_reserve(order)
+
+        # 预留已提交：调用柜台；柜台拒绝/异常时必须回滚释放预留
+        try:
+            result = self.adapter.place_order(order)
+        except Exception:
+            failed = self._mark_failed(order, "柜台调用异常")
+            self.portfolio_risk.on_order_update(failed)
+            raise
+
         if result.status in (OrderStatus.REJECTED, OrderStatus.FAILED):
+            # 回滚边界：预留释放，并留 RELEASE 审计
+            self.portfolio_risk.on_order_update(result)
             raise TradingException(
                 f"下单失败: {result.error_message}",
                 order_id=result.order_id,
                 stock_code=stock_code,
             )
-        
-        # 记录交易金额
+
+        # 挂单/部分成交/全成：以柜台返回状态同步台账（回调也会驱动，幂等）
+        self.portfolio_risk.on_order_update(result)
+
+        # 记录交易金额（兼容旧口径）
         if result.status == OrderStatus.FILLED:
             self.risk_manager.record_trade(result.filled_price * result.filled_quantity)
-        
-        return result.to_dict()
+
+        response = result.to_dict()
+        response["risk_decision_id"] = decision.decision_id
+        response["risk_rule_version"] = decision.rule_version
+        return response
+
+    @staticmethod
+    def _mark_failed(order: Order, message: str) -> Order:
+        order.status = OrderStatus.FAILED
+        order.error_message = message
+        return order
     
     def sell(
         self,
@@ -200,7 +246,11 @@ class TradingService:
         if not order:
             raise TradingException("订单不存在", order_id=order_id)
         
-        if order.status not in (OrderStatus.PENDING, OrderStatus.SUBMITTED):
+        if order.status not in (
+            OrderStatus.PENDING,
+            OrderStatus.SUBMITTED,
+            OrderStatus.PARTIAL_FILLED,
+        ):
             raise TradingException(
                 f"订单状态为 {order.status.value}，无法撤销",
                 order_id=order_id,
